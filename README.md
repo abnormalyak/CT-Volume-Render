@@ -25,30 +25,52 @@ The included `CThead` binary dataset is a classic publicly available CT scan of 
 
 ## Running
 
+### From IntelliJ IDEA (recommended, works on all platforms)
+
+1. Open the project
+2. Go to **File → Project Structure → Libraries** and add the JavaFX SDK `lib` folder as a library
+3. Go to **Run → Edit Configurations**, add the following to **VM options**:
+
+   - **macOS / Linux:**
+     ```
+     --module-path /path/to/javafx-sdk-21/lib --add-modules javafx.controls,javafx.graphics
+     ```
+   - **Windows:**
+     ```
+     --module-path C:\path\to\javafx-sdk-21\lib --add-modules javafx.controls,javafx.graphics
+     ```
+
+4. Run `Example`
+
 ### From the command line
 
+**macOS / Linux:**
 ```bash
-# Compile
 javac --module-path /path/to/javafx-sdk-21/lib \
       --add-modules javafx.controls,javafx.graphics \
       Example.java ColourHolder.java CustomTriple.java
 
-# Run
 java --module-path /path/to/javafx-sdk-21/lib \
      --add-modules javafx.controls,javafx.graphics \
      Example
 ```
 
-Replace `/path/to/javafx-sdk-21/lib` with the actual path to your JavaFX SDK `lib` folder.
+**Windows (Command Prompt):**
+```cmd
+javac --module-path C:\path\to\javafx-sdk-21\lib --add-modules javafx.controls,javafx.graphics Example.java ColourHolder.java CustomTriple.java
 
-### From IntelliJ IDEA
+java --module-path C:\path\to\javafx-sdk-21\lib --add-modules javafx.controls,javafx.graphics Example
+```
 
-1. Open the project
-2. Go to **File → Project Structure → Libraries** and add the JavaFX SDK `lib` folder as a library
-3. Go to **Run → Edit Configurations**, add the following to **VM options**:
-   ```
-   --module-path /path/to/javafx-sdk-21/lib --add-modules javafx.controls,javafx.graphics
-   ```
-4. Run `Example`
+**Windows (PowerShell):**
+```powershell
+javac --module-path "C:\path\to\javafx-sdk-21\lib" `
+      --add-modules javafx.controls,javafx.graphics `
+      Example.java ColourHolder.java CustomTriple.java
+
+java --module-path "C:\path\to\javafx-sdk-21\lib" `
+     --add-modules javafx.controls,javafx.graphics `
+     Example
+```
 
 > **Note:** the `CThead` data file must be in the working directory when the program is run. In IntelliJ this is the project root by default.
