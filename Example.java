@@ -344,7 +344,7 @@ public class Example extends Application {
 
         Thread t = new Thread(() -> {
             // Downsample by 2 for a manageable triangle count
-            TriangleMesh mesh = VoxelMesh.generate(cthead, 300, 2);
+            TriangleMesh mesh = VoxelMesh.generate(cthead, gradX, gradY, gradZ, 300, 2);
             Platform.runLater(() -> setup3DScene(stage3D, mesh));
         }, "skull-mesh-gen");
         t.setDaemon(true);
