@@ -5,13 +5,7 @@ import javafx.application.Platform;
 import javafx.event.EventHandler;
 import javafx.geometry.Insets;
 import javafx.geometry.Pos;
-import javafx.scene.AmbientLight;
-import javafx.scene.Group;
-import javafx.scene.PerspectiveCamera;
-import javafx.scene.PointLight;
 import javafx.scene.Scene;
-import javafx.scene.SceneAntialiasing;
-import javafx.scene.SubScene;
 import javafx.scene.control.Button;
 import javafx.scene.control.Label;
 import javafx.scene.control.ScrollPane;
@@ -29,11 +23,6 @@ import javafx.scene.layout.Region;
 import javafx.scene.layout.StackPane;
 import javafx.scene.layout.VBox;
 import javafx.scene.paint.Color;
-import javafx.scene.paint.PhongMaterial;
-import javafx.scene.shape.CullFace;
-import javafx.scene.shape.MeshView;
-import javafx.scene.shape.TriangleMesh;
-import javafx.scene.transform.Rotate;
 import javafx.stage.Stage;
 import java.io.*;
 import java.util.ArrayList;
@@ -64,6 +53,16 @@ public class Example extends Application {
     });
 
     private volatile int vrGeneration = 0;
+
+    // Separate executor + generation for the rotatable 3D raycaster window
+    private final ExecutorService vr3DExecutor = Executors.newSingleThreadExecutor(r -> {
+        Thread t = new Thread(r, "ct-3d");
+        t.setDaemon(true);
+        return t;
+    });
+    private volatile int    vr3DGeneration = 0;
+    private volatile double rot3DPitch = -Math.PI / 2; // start facing the front of the head
+    private volatile double rot3DYaw   = 0;
 
     // Crosshair state — tracks the current 3-D cursor position in CT space.
     // crosshairX = sagittal (Side) slider value
@@ -326,94 +325,17 @@ public class Example extends Application {
         stage.show();
     }
 
-    // ── 3D skull viewer ───────────────────────────────────────────────────────
+    // ── 3D skull viewer (raycasting with rotation) ───────────────────────────
 
     private void show3DView() {
         Stage stage3D = new Stage();
-        stage3D.setTitle("3D Skull View");
+        stage3D.setTitle("3D Skull View — Raycaster");
 
-        Label loading = new Label("Generating 3D mesh…\nthis may take a few seconds");
-        loading.setStyle(
-            "-fx-text-fill:" + C_TEXT + ";-fx-font-size:14px;" +
-            "-fx-text-alignment:center;-fx-alignment:center;"
-        );
-        StackPane loadingPane = new StackPane(loading);
-        loadingPane.setStyle("-fx-background-color:" + C_BG + ";");
-        stage3D.setScene(new Scene(loadingPane, 720, 620));
-        stage3D.show();
+        int W = 520, H = 520;
+        WritableImage image = new WritableImage(W, H);
+        ImageView view = new ImageView(image);
 
-        Thread t = new Thread(() -> {
-            // Downsample by 2 for a manageable triangle count
-            TriangleMesh mesh = VoxelMesh.generate(cthead, gradX, gradY, gradZ, 300, 2);
-            Platform.runLater(() -> setup3DScene(stage3D, mesh));
-        }, "skull-mesh-gen");
-        t.setDaemon(true);
-        t.start();
-    }
-
-    private void setup3DScene(Stage stage, TriangleMesh mesh) {
-        MeshView meshView = new MeshView(mesh);
-        PhongMaterial material = new PhongMaterial(Color.web("#e8e4d8"));
-        material.setSpecularColor(Color.WHITE);
-        material.setSpecularPower(20);
-        meshView.setMaterial(material);
-        // JavaFX winding-order is fiddly with our manually-built mesh — NONE renders
-        // both sides so the skull is always visible regardless of view angle
-        meshView.setCullFace(CullFace.NONE);
-
-        // Centre the mesh at the origin so rotations pivot around the skull centre
-        meshView.setTranslateX(-CT_x_axis / 2.0);
-        meshView.setTranslateY(-CT_y_axis / 2.0);
-        meshView.setTranslateZ(-CT_z_axis / 2.0);
-
-        Group meshGroup = new Group(meshView);
-
-        // Rotate the head upright on open: CT-Z axis (top→neck) → screen vertical
-        Rotate rotateX = new Rotate(-90, Rotate.X_AXIS);
-        Rotate rotateY = new Rotate(0,   Rotate.Y_AXIS);
-        meshGroup.getTransforms().addAll(rotateY, rotateX);
-
-        PointLight pointLight = new PointLight(Color.WHITE);
-        pointLight.setTranslateX(-300);
-        pointLight.setTranslateY(-400);
-        pointLight.setTranslateZ(-400);
-
-        AmbientLight ambient = new AmbientLight(Color.web("#3a3a44"));
-
-        Group root3D = new Group(meshGroup, pointLight, ambient);
-
-        PerspectiveCamera camera = new PerspectiveCamera(true);
-        camera.setNearClip(1);
-        camera.setFarClip(2000);
-        camera.setTranslateZ(-500);
-
-        int sceneW = 720, sceneH = 620;
-        SubScene subScene = new SubScene(root3D, sceneW, sceneH, true, SceneAntialiasing.BALANCED);
-        subScene.setFill(Color.web(C_BG));
-        subScene.setCamera(camera);
-
-        // Mouse drag → rotate around X and Y axes
-        final double[] anchor   = new double[2];
-        final double[] startRot = new double[2];
-        subScene.setOnMousePressed(e -> {
-            anchor[0]   = e.getSceneX();
-            anchor[1]   = e.getSceneY();
-            startRot[0] = rotateX.getAngle();
-            startRot[1] = rotateY.getAngle();
-        });
-        subScene.setOnMouseDragged(e -> {
-            rotateY.setAngle(startRot[1] + (e.getSceneX() - anchor[0]) * 0.5);
-            rotateX.setAngle(startRot[0] - (e.getSceneY() - anchor[1]) * 0.5);
-        });
-
-        // Scroll wheel → zoom (move camera along Z)
-        subScene.setOnScroll(e -> {
-            double z = camera.getTranslateZ() + e.getDeltaY();
-            camera.setTranslateZ(Math.max(-1500, Math.min(-150, z)));
-        });
-
-        // Hint label overlaid on the 3D scene
-        Label hint = new Label("Drag to rotate · Scroll to zoom");
+        Label hint = new Label("Drag to rotate");
         hint.setStyle(
             "-fx-text-fill:" + C_MUTED + ";-fx-font-size:11px;" +
             "-fx-background-color:rgba(15,23,42,0.75);" +
@@ -422,9 +344,106 @@ public class Example extends Application {
         StackPane.setAlignment(hint, Pos.BOTTOM_CENTER);
         StackPane.setMargin(hint, new Insets(0, 0, 14, 0));
 
-        StackPane root = new StackPane(subScene, hint);
+        StackPane root = new StackPane(view, hint);
         root.setStyle("-fx-background-color:" + C_BG + ";");
-        stage.setScene(new Scene(root, sceneW, sceneH));
+
+        // Mouse drag → rotate (pitch/yaw)
+        final double[] anchor = new double[2];
+        final double[] startRot = new double[2];
+        view.setOnMousePressed(e -> {
+            anchor[0]   = e.getSceneX();
+            anchor[1]   = e.getSceneY();
+            startRot[0] = rot3DPitch;
+            startRot[1] = rot3DYaw;
+        });
+        view.setOnMouseDragged(e -> {
+            rot3DPitch = startRot[0] - (e.getSceneY() - anchor[1]) * 0.01;
+            rot3DYaw   = startRot[1] + (e.getSceneX() - anchor[0]) * 0.01;
+            int gen = ++vr3DGeneration;
+            double p = rot3DPitch, y = rot3DYaw;
+            vr3DExecutor.submit(() -> render3D(image, p, y, gen));
+        });
+
+        stage3D.setScene(new Scene(root, W, H));
+        stage3D.show();
+
+        // Initial render
+        int gen = ++vr3DGeneration;
+        double p = rot3DPitch, y = rot3DYaw;
+        vr3DExecutor.submit(() -> render3D(image, p, y, gen));
+    }
+
+    // Per-pixel raycaster with rotation. Same diffuse-lighting model as the 2-D
+    // lightingTopDown etc., but the ray direction is rotated by (pitch, yaw)
+    // before walking the volume, giving an arbitrary 3-D view that the user
+    // can drag to spin.
+    private void render3D(WritableImage image, double pitch, double yaw, int gen) {
+        int w = (int) image.getWidth(), h = (int) image.getHeight();
+        int[] pixels = new int[w * h];
+
+        double cosP = Math.cos(pitch), sinP = Math.sin(pitch);
+        double cosY = Math.cos(yaw),   sinY = Math.sin(yaw);
+
+        double vcx = CT_x_axis / 2.0;
+        double vcy = CT_y_axis / 2.0;
+        double vcz = CT_z_axis / 2.0;
+
+        // Light direction in volume space: inverse-rotated (0,0,-1).
+        // i.e. the light comes from behind the camera and rotates with it,
+        // so the camera-facing side of the skull is always lit.
+        double lx =  sinY * cosP;
+        double ly = -sinP;
+        double lz = -cosY * cosP;
+
+        int maxSteps  = (int) Math.ceil(Math.sqrt(
+            CT_x_axis * CT_x_axis + CT_y_axis * CT_y_axis + CT_z_axis * CT_z_axis));
+        int startOff  = -maxSteps / 2;
+
+        IntStream.range(0, h).parallel().forEach(py -> {
+            if (vr3DGeneration != gen) return; // newer render queued — abort
+            double camY = py - h / 2.0;
+            for (int px = 0; px < w; px++) {
+                double camX = px - w / 2.0;
+                double color = 0;
+
+                for (int t = 0; t < maxSteps; t++) {
+                    double camZ = startOff + t;
+
+                    // Inverse rotation: Rx(-pitch) then Ry(-yaw) on (camX, camY, camZ)
+                    double yp = cosP * camY + sinP * camZ;
+                    double zp = -sinP * camY + cosP * camZ;
+                    double vx = cosY * camX - sinY * zp;
+                    double vy = yp;
+                    double vz = sinY * camX + cosY * zp;
+
+                    int sx = (int) (vx + vcx);
+                    int sy = (int) (vy + vcy);
+                    int sz = (int) (vz + vcz);
+                    if (sx < 0 || sx >= CT_x_axis ||
+                        sy < 0 || sy >= CT_y_axis ||
+                        sz < 0 || sz >= CT_z_axis) continue;
+
+                    if (cthead[sz][sy][sx] > 300) {
+                        double nx = -gradX[sz][sy][sx];
+                        double ny = -gradY[sz][sy][sx];
+                        double nz = -gradZ[sz][sy][sx];
+                        double nLen = Math.sqrt(nx*nx + ny*ny + nz*nz);
+                        if (nLen > 0) { nx /= nLen; ny /= nLen; nz /= nLen; }
+                        color = Math.max(0, lx*nx + ly*ny + lz*nz);
+                        break;
+                    }
+                }
+
+                int ci = (int) (color * 255);
+                pixels[py * w + px] = (0xFF << 24) | (ci << 16) | (ci << 8) | ci;
+            }
+        });
+
+        if (vr3DGeneration == gen) {
+            Platform.runLater(() ->
+                image.getPixelWriter().setPixels(0, 0, w, h,
+                    PixelFormat.getIntArgbInstance(), pixels, 0, w));
+        }
     }
 
     // ── Crosshair helpers ─────────────────────────────────────────────────────
