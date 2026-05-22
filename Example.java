@@ -2,9 +2,16 @@ import java.io.FileInputStream;
 import java.io.FileNotFoundException;
 import javafx.application.Application;
 import javafx.application.Platform;
+import javafx.event.EventHandler;
 import javafx.geometry.Insets;
 import javafx.geometry.Pos;
+import javafx.scene.AmbientLight;
+import javafx.scene.Group;
+import javafx.scene.PerspectiveCamera;
+import javafx.scene.PointLight;
 import javafx.scene.Scene;
+import javafx.scene.SceneAntialiasing;
+import javafx.scene.SubScene;
 import javafx.scene.control.Button;
 import javafx.scene.control.Label;
 import javafx.scene.control.ScrollPane;
@@ -14,14 +21,19 @@ import javafx.scene.image.ImageView;
 import javafx.scene.image.PixelFormat;
 import javafx.scene.image.WritableImage;
 import javafx.scene.image.PixelWriter;
-import javafx.event.EventHandler;
 import javafx.scene.input.MouseEvent;
 import javafx.scene.layout.BorderPane;
 import javafx.scene.layout.HBox;
 import javafx.scene.layout.Priority;
 import javafx.scene.layout.Region;
+import javafx.scene.layout.StackPane;
 import javafx.scene.layout.VBox;
 import javafx.scene.paint.Color;
+import javafx.scene.paint.PhongMaterial;
+import javafx.scene.shape.CullFace;
+import javafx.scene.shape.MeshView;
+import javafx.scene.shape.TriangleMesh;
+import javafx.scene.transform.Rotate;
 import javafx.stage.Stage;
 import java.io.*;
 import java.util.ArrayList;
@@ -247,7 +259,6 @@ public class Example extends Application {
                 crosshairButton.setText("Crosshair: OFF");
                 setButtonColor(crosshairButton, C_ACCENT);
             }
-            // Redraw all slice views to add or remove the crosshair overlay
             int z = crosshairZ, y = crosshairY, x = crosshairX;
             sliceExecutor.submit(() -> {
                 drawTopImage(top_image, z);
@@ -256,6 +267,9 @@ public class Example extends Application {
             });
         });
 
+        Button skull3DButton = styledButton("Open 3D Skull View", "#8b5cf6");
+        skull3DButton.setOnAction(e -> show3DView());
+
         // ── Controls panel ───────────────────────────────────────────────────
         Label controlsTitle = new Label("Controls");
         controlsTitle.setStyle("-fx-text-fill:" + C_TEXT + ";-fx-font-size:15px;-fx-font-weight:bold;");
@@ -263,6 +277,7 @@ public class Example extends Application {
         VBox controlsPanel = new VBox(10,
             controlsTitle,
             crosshairButton,
+            skull3DButton,
             separator(),
             sliderCard("Axial Slice (Z)",   Top_slider,      topVal,
                 "Scroll through horizontal cross-sections from the top of the skull down to the neck (0 – 112 slices)."),
@@ -309,6 +324,107 @@ public class Example extends Application {
         Scene scene = new Scene(root, 1300, 800);
         stage.setScene(scene);
         stage.show();
+    }
+
+    // ── 3D skull viewer ───────────────────────────────────────────────────────
+
+    private void show3DView() {
+        Stage stage3D = new Stage();
+        stage3D.setTitle("3D Skull View");
+
+        Label loading = new Label("Generating 3D mesh…\nthis may take a few seconds");
+        loading.setStyle(
+            "-fx-text-fill:" + C_TEXT + ";-fx-font-size:14px;" +
+            "-fx-text-alignment:center;-fx-alignment:center;"
+        );
+        StackPane loadingPane = new StackPane(loading);
+        loadingPane.setStyle("-fx-background-color:" + C_BG + ";");
+        stage3D.setScene(new Scene(loadingPane, 720, 620));
+        stage3D.show();
+
+        Thread t = new Thread(() -> {
+            // Downsample by 2 for a manageable triangle count
+            TriangleMesh mesh = VoxelMesh.generate(cthead, 300, 2);
+            Platform.runLater(() -> setup3DScene(stage3D, mesh));
+        }, "skull-mesh-gen");
+        t.setDaemon(true);
+        t.start();
+    }
+
+    private void setup3DScene(Stage stage, TriangleMesh mesh) {
+        MeshView meshView = new MeshView(mesh);
+        PhongMaterial material = new PhongMaterial(Color.web("#e8e4d8"));
+        material.setSpecularColor(Color.WHITE);
+        material.setSpecularPower(20);
+        meshView.setMaterial(material);
+        // JavaFX winding-order is fiddly with our manually-built mesh — NONE renders
+        // both sides so the skull is always visible regardless of view angle
+        meshView.setCullFace(CullFace.NONE);
+
+        // Centre the mesh at the origin so rotations pivot around the skull centre
+        meshView.setTranslateX(-CT_x_axis / 2.0);
+        meshView.setTranslateY(-CT_y_axis / 2.0);
+        meshView.setTranslateZ(-CT_z_axis / 2.0);
+
+        Group meshGroup = new Group(meshView);
+
+        // Rotate the head upright on open: CT-Z axis (top→neck) → screen vertical
+        Rotate rotateX = new Rotate(-90, Rotate.X_AXIS);
+        Rotate rotateY = new Rotate(0,   Rotate.Y_AXIS);
+        meshGroup.getTransforms().addAll(rotateY, rotateX);
+
+        PointLight pointLight = new PointLight(Color.WHITE);
+        pointLight.setTranslateX(-300);
+        pointLight.setTranslateY(-400);
+        pointLight.setTranslateZ(-400);
+
+        AmbientLight ambient = new AmbientLight(Color.web("#3a3a44"));
+
+        Group root3D = new Group(meshGroup, pointLight, ambient);
+
+        PerspectiveCamera camera = new PerspectiveCamera(true);
+        camera.setNearClip(1);
+        camera.setFarClip(2000);
+        camera.setTranslateZ(-500);
+
+        int sceneW = 720, sceneH = 620;
+        SubScene subScene = new SubScene(root3D, sceneW, sceneH, true, SceneAntialiasing.BALANCED);
+        subScene.setFill(Color.web(C_BG));
+        subScene.setCamera(camera);
+
+        // Mouse drag → rotate around X and Y axes
+        final double[] anchor   = new double[2];
+        final double[] startRot = new double[2];
+        subScene.setOnMousePressed(e -> {
+            anchor[0]   = e.getSceneX();
+            anchor[1]   = e.getSceneY();
+            startRot[0] = rotateX.getAngle();
+            startRot[1] = rotateY.getAngle();
+        });
+        subScene.setOnMouseDragged(e -> {
+            rotateY.setAngle(startRot[1] + (e.getSceneX() - anchor[0]) * 0.5);
+            rotateX.setAngle(startRot[0] - (e.getSceneY() - anchor[1]) * 0.5);
+        });
+
+        // Scroll wheel → zoom (move camera along Z)
+        subScene.setOnScroll(e -> {
+            double z = camera.getTranslateZ() + e.getDeltaY();
+            camera.setTranslateZ(Math.max(-1500, Math.min(-150, z)));
+        });
+
+        // Hint label overlaid on the 3D scene
+        Label hint = new Label("Drag to rotate · Scroll to zoom");
+        hint.setStyle(
+            "-fx-text-fill:" + C_MUTED + ";-fx-font-size:11px;" +
+            "-fx-background-color:rgba(15,23,42,0.75);" +
+            "-fx-padding:6 12;-fx-background-radius:6;"
+        );
+        StackPane.setAlignment(hint, Pos.BOTTOM_CENTER);
+        StackPane.setMargin(hint, new Insets(0, 0, 14, 0));
+
+        StackPane root = new StackPane(subScene, hint);
+        root.setStyle("-fx-background-color:" + C_BG + ";");
+        stage.setScene(new Scene(root, sceneW, sceneH));
     }
 
     // ── Crosshair helpers ─────────────────────────────────────────────────────
