@@ -37,15 +37,26 @@ public class Example extends Application {
     int CT_y_axis = 256;
     int CT_z_axis = 113;
 
-    // Precomputed gradient volume for lighting — computed once in ReadData()
     float[][][] gradX, gradY, gradZ;
 
-    // Single background thread for all renders; keeps UI responsive
-    private final ExecutorService renderExecutor = Executors.newSingleThreadExecutor(r -> {
-        Thread t = new Thread(r, "ct-render");
+    // Separate executor for fast slice renders so they are never blocked by VR/lighting
+    private final ExecutorService sliceExecutor = Executors.newSingleThreadExecutor(r -> {
+        Thread t = new Thread(r, "ct-slice");
         t.setDaemon(true);
         return t;
     });
+
+    // Dedicated executor for expensive VR/lighting renders
+    private final ExecutorService vrExecutor = Executors.newSingleThreadExecutor(r -> {
+        Thread t = new Thread(r, "ct-vr");
+        t.setDaemon(true);
+        return t;
+    });
+
+    // Incremented every time a new VR/lighting render is requested.
+    // Each render captures the generation at submission time and aborts
+    // row-by-row if the counter has moved on (i.e. a newer request arrived).
+    private volatile int vrGeneration = 0;
 
     private static final String C_BG     = "#0f172a";
     private static final String C_PANEL  = "#1e293b";
@@ -91,46 +102,55 @@ public class Example extends Application {
         Label skinVal     = valueLabel("Opacity: 0.00");
         Label lightingVal = valueLabel("Position: 0");
 
-        // ── Listeners ────────────────────────────────────────────────────────
-        // Slice renders are fast — submit directly with no debounce
+        // ── Slice listeners — fast path, dedicated executor ───────────────────
         Top_slider.valueProperty().addListener((obs, o, n) -> {
             int i = n.intValue();
             topVal.setText("Slice: " + i);
-            renderExecutor.submit(() -> drawTopImage(top_image, i));
+            sliceExecutor.submit(() -> drawTopImage(top_image, i));
         });
 
         Front_slider.valueProperty().addListener((obs, o, n) -> {
             int i = n.intValue();
             frontVal.setText("Slice: " + i);
-            renderExecutor.submit(() -> drawFrontImage(front_image, i));
+            sliceExecutor.submit(() -> drawFrontImage(front_image, i));
         });
 
         Side_slider.valueProperty().addListener((obs, o, n) -> {
             int i = n.intValue();
             sideVal.setText("Slice: " + i);
-            renderExecutor.submit(() -> drawSideImage(side_image, i));
+            sliceExecutor.submit(() -> drawSideImage(side_image, i));
         });
 
-        // Volume render and lighting are expensive — debounce 150ms so the
-        // executor queue doesn't fill up while the slider is being dragged
-        PauseTransition skinDebounce = new PauseTransition(Duration.millis(150));
+        // ── VR/lighting listeners — generation-based cancellation + 30ms debounce
+        // The debounce prevents queue buildup while dragging quickly.
+        // The generation counter makes any in-progress render abort at the next
+        // row boundary so the new render can start almost immediately.
+        PauseTransition skinDebounce = new PauseTransition(Duration.millis(30));
         Skin_slider.valueProperty().addListener((obs, o, n) -> {
             double v = n.doubleValue();
             skinVal.setText(String.format("Opacity: %.2f", v));
-            skinDebounce.setOnFinished(e -> renderExecutor.submit(() -> volumeRenderAll(images, v)));
+            int gen = ++vrGeneration;
+            skinDebounce.setOnFinished(e -> {
+                if (vrGeneration == gen)
+                    vrExecutor.submit(() -> volumeRenderAll(images, v, gen));
+            });
             skinDebounce.playFromStart();
         });
 
-        PauseTransition lightingDebounce = new PauseTransition(Duration.millis(150));
+        PauseTransition lightingDebounce = new PauseTransition(Duration.millis(30));
         lighting_slider.valueProperty().addListener((obs, o, n) -> {
             int i = n.intValue();
             lightingVal.setText("Position: " + i);
-            lightingDebounce.setOnFinished(e -> renderExecutor.submit(() -> lightingAll(images, new CustomTriple(i, 0.0, 0.0))));
+            int gen = ++vrGeneration;
+            lightingDebounce.setOnFinished(e -> {
+                if (vrGeneration == gen)
+                    vrExecutor.submit(() -> lightingAll(images, new CustomTriple(i, 0.0, 0.0), gen));
+            });
             lightingDebounce.playFromStart();
         });
 
         // ── Initial render ───────────────────────────────────────────────────
-        renderExecutor.submit(() -> {
+        sliceExecutor.submit(() -> {
             drawTopImage(top_image, 0);
             drawFrontImage(front_image, 0);
             drawSideImage(side_image, 0);
@@ -147,10 +167,18 @@ public class Example extends Application {
 
         // ── Buttons ──────────────────────────────────────────────────────────
         Button volRend_button = styledButton("Volume Render");
-        volRend_button.setOnAction(e -> renderExecutor.submit(() -> volumeRenderAll(images, Skin_slider.getValue())));
+        volRend_button.setOnAction(e -> {
+            double v = Skin_slider.getValue();
+            int gen = ++vrGeneration;
+            vrExecutor.submit(() -> volumeRenderAll(images, v, gen));
+        });
 
         Button lightingButton = styledButton("Apply Lighting");
-        lightingButton.setOnAction(e -> renderExecutor.submit(() -> lightingAll(images, new CustomTriple(lighting_slider.getValue(), 0, 0))));
+        lightingButton.setOnAction(e -> {
+            CustomTriple light = new CustomTriple(lighting_slider.getValue(), 0, 0);
+            int gen = ++vrGeneration;
+            vrExecutor.submit(() -> lightingAll(images, light, gen));
+        });
 
         // ── Controls panel ───────────────────────────────────────────────────
         Label controlsTitle = new Label("Controls");
@@ -197,7 +225,6 @@ public class Example extends Application {
         header.setPadding(new Insets(14, 20, 14, 20));
         header.setStyle("-fx-background-color:#1e293b;-fx-border-color:" + C_BORDER + ";-fx-border-width:0 0 1 0;");
 
-        // ── Root layout ──────────────────────────────────────────────────────
         BorderPane root = new BorderPane();
         root.setTop(header);
         root.setCenter(imageRow);
@@ -253,8 +280,6 @@ public class Example extends Application {
         precomputeGradients();
     }
 
-    // Computes central-difference gradients for the whole volume once at startup.
-    // Lighting renders do a single array lookup instead of recomputing on every ray.
     private void precomputeGradients() {
         gradX = new float[CT_z_axis][CT_y_axis][CT_x_axis];
         gradY = new float[CT_z_axis][CT_y_axis][CT_x_axis];
@@ -332,207 +357,188 @@ public class Example extends Application {
 
     // ── Volume rendering ──────────────────────────────────────────────────────
 
-    public void volumeRenderAll(ArrayList<WritableImage> images, double skinOpacity) {
-        volumeRenderTopDown(images.get(0), skinOpacity);
-        volumeRenderFrontBack(images.get(1), skinOpacity);
-        volumeRenderSide(images.get(2), skinOpacity);
+    public void volumeRenderAll(ArrayList<WritableImage> images, double skinOpacity, int gen) {
+        volumeRenderTopDown(images.get(0), skinOpacity, gen);
+        volumeRenderFrontBack(images.get(1), skinOpacity, gen);
+        volumeRenderSide(images.get(2), skinOpacity, gen);
     }
 
-    public void volumeRenderTopDown(WritableImage image, double skinOpacity) {
+    public void volumeRenderTopDown(WritableImage image, double skinOpacity, int gen) {
         int w = (int) image.getWidth(), h = (int) image.getHeight();
         int[] pixels = new int[w * h];
 
         IntStream.range(0, h).parallel().forEach(y -> {
+            if (vrGeneration != gen) return; // abort: newer render requested
             for (int x = 0; x < w; x++) {
                 double r = 0, g = 0, b = 0, transparency = 1.0;
-
                 for (int z = 0; z < CT_z_axis; z++) {
                     short datum = cthead[z][y][x];
                     double er, eg, eb, ea;
-
-                    if      (datum < -300)               continue;
+                    if      (datum < -300)                continue;
                     else if (datum >= 50 && datum <= 299) continue;
                     else if (datum <= 49) { er = 1.0; eg = 0.79; eb = 0.6; ea = skinOpacity; }
                     else                  { er = 1.0; eg = 1.0;  eb = 1.0; ea = 0.8; }
-
                     r += er * ea * transparency;
                     g += eg * ea * transparency;
                     b += eb * ea * transparency;
                     transparency *= (1.0 - ea);
                     if (transparency < 0.01) break;
                 }
-
                 pixels[y * w + x] = toArgb(Math.min(r, 1), Math.min(g, 1), Math.min(b, 1));
             }
         });
 
-        writePixels(image, pixels);
+        if (vrGeneration == gen) writePixels(image, pixels);
     }
 
-    public void volumeRenderFrontBack(WritableImage image, double skinOpacity) {
+    public void volumeRenderFrontBack(WritableImage image, double skinOpacity, int gen) {
         int w = (int) image.getWidth(), h = (int) image.getHeight();
         int[] pixels = new int[w * h];
 
         IntStream.range(0, h).parallel().forEach(z -> {
+            if (vrGeneration != gen) return;
             for (int x = 0; x < w; x++) {
                 double r = 0, g = 0, b = 0, transparency = 1.0;
-
                 for (int y = 0; y < CT_y_axis - 1; y++) {
                     short datum = cthead[z][y][x];
                     double er, eg, eb, ea;
-
-                    if      (datum < -300)               continue;
+                    if      (datum < -300)                continue;
                     else if (datum >= 50 && datum <= 299) continue;
                     else if (datum <= 49) { er = 1.0; eg = 0.79; eb = 0.6; ea = skinOpacity; }
                     else                  { er = 1.0; eg = 1.0;  eb = 1.0; ea = 0.8; }
-
                     r += er * ea * transparency;
                     g += eg * ea * transparency;
                     b += eb * ea * transparency;
                     transparency *= (1.0 - ea);
                     if (transparency < 0.01) break;
                 }
-
                 pixels[z * w + x] = toArgb(Math.min(r, 1), Math.min(g, 1), Math.min(b, 1));
             }
         });
 
-        writePixels(image, pixels);
+        if (vrGeneration == gen) writePixels(image, pixels);
     }
 
-    public void volumeRenderSide(WritableImage image, double skinOpacity) {
+    public void volumeRenderSide(WritableImage image, double skinOpacity, int gen) {
         int w = (int) image.getWidth(), h = (int) image.getHeight();
         int[] pixels = new int[w * h];
 
         IntStream.range(0, h).parallel().forEach(z -> {
+            if (vrGeneration != gen) return;
             for (int y = 0; y < w; y++) {
                 double r = 0, g = 0, b = 0, transparency = 1.0;
-
                 for (int x = 0; x < CT_x_axis - 1; x++) {
                     short datum = cthead[z][y][x];
                     double er, eg, eb, ea;
-
-                    if      (datum < -300)               continue;
+                    if      (datum < -300)                continue;
                     else if (datum >= 50 && datum <= 299) continue;
                     else if (datum <= 49) { er = 1.0; eg = 0.79; eb = 0.6; ea = skinOpacity; }
                     else                  { er = 1.0; eg = 1.0;  eb = 1.0; ea = 0.8; }
-
                     r += er * ea * transparency;
                     g += eg * ea * transparency;
                     b += eb * ea * transparency;
                     transparency *= (1.0 - ea);
                     if (transparency < 0.01) break;
                 }
-
                 pixels[z * w + y] = toArgb(Math.min(r, 1), Math.min(g, 1), Math.min(b, 1));
             }
         });
 
-        writePixels(image, pixels);
+        if (vrGeneration == gen) writePixels(image, pixels);
     }
 
     // ── Lighting ──────────────────────────────────────────────────────────────
 
-    public void lightingAll(ArrayList<WritableImage> images, CustomTriple pointLight) {
+    public void lightingAll(ArrayList<WritableImage> images, CustomTriple pointLight, int gen) {
         CustomTriple pointLightSide  = new CustomTriple(pointLight.getY(), pointLight.getX(), pointLight.getZ());
         CustomTriple pointLightFront = new CustomTriple(pointLight.getZ(), pointLight.getY(), pointLight.getX());
-
-        lightingTopDown(images.get(0), pointLight);
-        lightingFrontBack(images.get(1), pointLightFront);
-        lightingSide(images.get(2), pointLightSide);
+        lightingTopDown(images.get(0), pointLight, gen);
+        lightingFrontBack(images.get(1), pointLightFront, gen);
+        lightingSide(images.get(2), pointLightSide, gen);
     }
 
-    public void lightingTopDown(WritableImage image, CustomTriple pointLight) {
+    public void lightingTopDown(WritableImage image, CustomTriple pointLight, int gen) {
         int w = (int) image.getWidth(), h = (int) image.getHeight();
         int[] pixels = new int[w * h];
         double lx = pointLight.getX(), ly = pointLight.getY(), lz = pointLight.getZ();
 
         IntStream.range(0, h).parallel().forEach(y -> {
+            if (vrGeneration != gen) return;
             for (int x = 0; x < w; x++) {
                 double cr = 0, cg = 0, cb = 0;
-
                 for (int z = 0; z < CT_z_axis; z++) {
                     if (cthead[z][y][x] > 300) {
                         double dx = lx - x, dy = ly - y, dz = lz - z;
                         double dLen = Math.sqrt(dx*dx + dy*dy + dz*dz);
                         if (dLen > 0) { dx /= dLen; dy /= dLen; dz /= dLen; }
-
                         double nx = gradX[z][y][x], ny = gradY[z][y][x], nz = gradZ[z][y][x];
                         double nLen = Math.sqrt(nx*nx + ny*ny + nz*nz);
                         if (nLen > 0) { nx /= nLen; ny /= nLen; nz /= nLen; }
-
                         double cosTheta = Math.max(0, dx*nx + dy*ny + dz*nz);
                         cr = cosTheta; cg = cosTheta; cb = cosTheta;
                     }
                 }
-
                 pixels[y * w + x] = toArgb(cr, cg, cb);
             }
         });
 
-        writePixels(image, pixels);
+        if (vrGeneration == gen) writePixels(image, pixels);
     }
 
-    public void lightingFrontBack(WritableImage image, CustomTriple pointLight) {
+    public void lightingFrontBack(WritableImage image, CustomTriple pointLight, int gen) {
         int w = (int) image.getWidth(), h = (int) image.getHeight();
         int[] pixels = new int[w * h];
         double lx = pointLight.getX(), ly = pointLight.getY(), lz = pointLight.getZ();
 
         IntStream.range(0, h).parallel().forEach(z -> {
+            if (vrGeneration != gen) return;
             for (int x = 0; x < w; x++) {
                 double cr = 0, cg = 0, cb = 0;
-
                 for (int y = 0; y < CT_y_axis - 1; y++) {
                     if (cthead[z][y][x] > 300) {
                         double dx = lx - x, dy = ly - y, dz = lz - z;
                         double dLen = Math.sqrt(dx*dx + dy*dy + dz*dz);
                         if (dLen > 0) { dx /= dLen; dy /= dLen; dz /= dLen; }
-
                         double nx = gradX[z][y][x], ny = gradY[z][y][x], nz = gradZ[z][y][x];
                         double nLen = Math.sqrt(nx*nx + ny*ny + nz*nz);
                         if (nLen > 0) { nx /= nLen; ny /= nLen; nz /= nLen; }
-
                         double cosTheta = Math.max(0, dx*nx + dy*ny + dz*nz);
                         cr = cosTheta; cg = cosTheta; cb = cosTheta;
                     }
                 }
-
                 pixels[z * w + x] = toArgb(cr, cg, cb);
             }
         });
 
-        writePixels(image, pixels);
+        if (vrGeneration == gen) writePixels(image, pixels);
     }
 
-    public void lightingSide(WritableImage image, CustomTriple pointLight) {
+    public void lightingSide(WritableImage image, CustomTriple pointLight, int gen) {
         int w = (int) image.getWidth(), h = (int) image.getHeight();
         int[] pixels = new int[w * h];
         double lx = pointLight.getX(), ly = pointLight.getY(), lz = pointLight.getZ();
 
         IntStream.range(0, h).parallel().forEach(z -> {
+            if (vrGeneration != gen) return;
             for (int y = 0; y < w; y++) {
                 double cr = 0, cg = 0, cb = 0;
-
                 for (int x = 0; x < CT_x_axis - 1; x++) {
                     if (cthead[z][y][x] > 300) {
                         double dx = lx - x, dy = ly - y, dz = lz - z;
                         double dLen = Math.sqrt(dx*dx + dy*dy + dz*dz);
                         if (dLen > 0) { dx /= dLen; dy /= dLen; dz /= dLen; }
-
                         double nx = gradX[z][y][x], ny = gradY[z][y][x], nz = gradZ[z][y][x];
                         double nLen = Math.sqrt(nx*nx + ny*ny + nz*nz);
                         if (nLen > 0) { nx /= nLen; ny /= nLen; nz /= nLen; }
-
                         double cosTheta = Math.max(0, dx*nx + dy*ny + dz*nz);
                         cr = cosTheta; cg = cosTheta; cb = cosTheta;
                     }
                 }
-
                 pixels[z * w + y] = toArgb(cr, cg, cb);
             }
         });
 
-        writePixels(image, pixels);
+        if (vrGeneration == gen) writePixels(image, pixels);
     }
 
     // ── Volume render helpers (retained for reference) ────────────────────────
@@ -550,10 +556,10 @@ public class Example extends Application {
     }
 
     public ColourHolder evaluateColor(short datum, double skinOpacity) {
-        if (datum < -300)                         return new ColourHolder(0.0, 0.0, 0.0, 0.0);
-        else if (-300 <= datum && datum <= 49)    return new ColourHolder(1.0, 0.79, 0.6, skinOpacity);
-        else if (50 <= datum && datum <= 299)     return new ColourHolder(0.0, 0.0, 0.0, 0.0);
-        else                                      return new ColourHolder(1.0, 1.0,  1.0, 0.8);
+        if (datum < -300)                      return new ColourHolder(0.0, 0.0, 0.0, 0.0);
+        else if (-300 <= datum && datum <= 49) return new ColourHolder(1.0, 0.79, 0.6, skinOpacity);
+        else if (50 <= datum && datum <= 299)  return new ColourHolder(0.0, 0.0, 0.0, 0.0);
+        else                                   return new ColourHolder(1.0, 1.0,  1.0, 0.8);
     }
 
     private ColourHolder adjustValues(ColourHolder rgb) {
@@ -592,15 +598,12 @@ public class Example extends Application {
         double nx = x == 0            ? cthead[z][y][x+1] - cthead[z][y][x]
                   : x < CT_x_axis - 1 ? cthead[z][y][x+1] - cthead[z][y][x-1]
                   :                     cthead[z][y][x]   - cthead[z][y][x-1];
-
         double ny = y == 0            ? cthead[z][y+1][x] - cthead[z][y][x]
                   : y < CT_y_axis - 1 ? cthead[z][y+1][x] - cthead[z][y-1][x]
                   :                     cthead[z][y][x]   - cthead[z][y-1][x];
-
         double nz = z == 0            ? cthead[z+1][y][x] - cthead[z][y][x]
                   : z < CT_z_axis - 1 ? cthead[z+1][y][x] - cthead[z-1][y][x]
                   :                     cthead[z][y][x]   - cthead[z-1][y][x];
-
         return new CustomTriple(nx, ny, nz);
     }
 
