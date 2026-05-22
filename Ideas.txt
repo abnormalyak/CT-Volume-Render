@@ -1,0 +1,7 @@
+My idea of how to use transfer function (initially):
+- volumeRenderTopDown function goes through each pixel
+- calls evaluateColor (transfer function) on each datum, gives the color of that pixel
+- refer to vol rend slides & recording for the compositing (four steps; separate functions? i dont know - maybe not every step, some may just be separate loops)
+
+Things to look into:
+- LUT (after successful if/else implementation of Q2)
