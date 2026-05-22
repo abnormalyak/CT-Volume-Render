@@ -14,6 +14,8 @@ import javafx.scene.image.ImageView;
 import javafx.scene.image.PixelFormat;
 import javafx.scene.image.WritableImage;
 import javafx.scene.image.PixelWriter;
+import javafx.event.EventHandler;
+import javafx.scene.input.MouseEvent;
 import javafx.scene.layout.BorderPane;
 import javafx.scene.layout.HBox;
 import javafx.scene.layout.Priority;
@@ -37,24 +39,29 @@ public class Example extends Application {
 
     float[][][] gradX, gradY, gradZ;
 
-    // Separate executor for fast slice renders so they are never blocked by VR/lighting
     private final ExecutorService sliceExecutor = Executors.newSingleThreadExecutor(r -> {
         Thread t = new Thread(r, "ct-slice");
         t.setDaemon(true);
         return t;
     });
 
-    // Dedicated executor for expensive VR/lighting renders
     private final ExecutorService vrExecutor = Executors.newSingleThreadExecutor(r -> {
         Thread t = new Thread(r, "ct-vr");
         t.setDaemon(true);
         return t;
     });
 
-    // Incremented every time a new VR/lighting render is requested.
-    // Each render captures the generation at submission time and aborts
-    // row-by-row if the counter has moved on (i.e. a newer request arrived).
     private volatile int vrGeneration = 0;
+
+    // Crosshair state — tracks the current 3-D cursor position in CT space.
+    // crosshairX = sagittal (Side) slider value
+    // crosshairY = coronal  (Front) slider value
+    // crosshairZ = axial    (Top)   slider value
+    private volatile int     crosshairX = 0, crosshairY = 0, crosshairZ = 0;
+    private volatile boolean crosshairEnabled = false;
+
+    private static final int CROSSHAIR_COLOR = 0xFF00E5FF; // bright cyan
+    private static final int CROSSHAIR_GAP   = 10;         // pixel gap around centre intersection
 
     private static final String C_BG     = "#0f172a";
     private static final String C_PANEL  = "#1e293b";
@@ -62,6 +69,7 @@ public class Example extends Application {
     private static final String C_ACCENT = "#3b82f6";
     private static final String C_TEXT   = "#f1f5f9";
     private static final String C_MUTED  = "#94a3b8";
+    private static final String C_GREEN  = "#22c55e";
 
     @Override
     public void start(Stage stage) throws FileNotFoundException, IOException {
@@ -69,17 +77,19 @@ public class Example extends Application {
 
         ReadData();
 
-        int Top_width   = CT_x_axis, Top_height   = CT_y_axis;
-        int Front_width = CT_x_axis, Front_height = CT_z_axis;
-        int Side_width  = CT_y_axis, Side_height  = CT_z_axis;
-
-        WritableImage top_image   = new WritableImage(Top_width,   Top_height);
-        WritableImage front_image = new WritableImage(Front_width, Front_height);
-        WritableImage side_image  = new WritableImage(Side_width,  Side_height);
+        WritableImage top_image   = new WritableImage(CT_x_axis, CT_y_axis);
+        WritableImage front_image = new WritableImage(CT_x_axis, CT_z_axis);
+        WritableImage side_image  = new WritableImage(CT_y_axis, CT_z_axis);
 
         ImageView TopView   = new ImageView(top_image);
         ImageView FrontView = new ImageView(front_image);
         ImageView SideView  = new ImageView(side_image);
+
+        // Scale each image up to fill more space; preserve aspect ratio
+        for (ImageView v : new ImageView[]{TopView, FrontView, SideView}) {
+            v.setFitWidth(300);
+            v.setPreserveRatio(true);
+        }
 
         ArrayList<WritableImage> images = new ArrayList<>();
         images.add(top_image);
@@ -93,35 +103,52 @@ public class Example extends Application {
         Slider Skin_slider     = makeSlider(0, 1, 0.25);
         Slider lighting_slider = makeSlider(0, 255, 50);
 
-        // ── Value labels ─────────────────────────────────────────────────────
         Label topVal      = valueLabel("Slice: 0");
         Label frontVal    = valueLabel("Slice: 0");
         Label sideVal     = valueLabel("Slice: 0");
         Label skinVal     = valueLabel("Opacity: 0.00");
         Label lightingVal = valueLabel("Position: 0");
 
-        // ── Slice listeners — fast path, dedicated executor ───────────────────
+        // ── Slice listeners ───────────────────────────────────────────────────
+        // Each updates its crosshair coordinate. When crosshair is on, all three
+        // views redraw so every view's crosshair lines stay in sync.
         Top_slider.valueProperty().addListener((obs, o, n) -> {
-            int i = n.intValue();
-            topVal.setText("Slice: " + i);
-            sliceExecutor.submit(() -> drawTopImage(top_image, i));
+            int z = n.intValue();
+            topVal.setText("Slice: " + z);
+            crosshairZ = z;
+            sliceExecutor.submit(() -> drawTopImage(top_image, z));
+            if (crosshairEnabled) {
+                int y = crosshairY, x = crosshairX;
+                sliceExecutor.submit(() -> drawFrontImage(front_image, y));
+                sliceExecutor.submit(() -> drawSideImage(side_image, x));
+            }
         });
 
         Front_slider.valueProperty().addListener((obs, o, n) -> {
-            int i = n.intValue();
-            frontVal.setText("Slice: " + i);
-            sliceExecutor.submit(() -> drawFrontImage(front_image, i));
+            int y = n.intValue();
+            frontVal.setText("Slice: " + y);
+            crosshairY = y;
+            sliceExecutor.submit(() -> drawFrontImage(front_image, y));
+            if (crosshairEnabled) {
+                int z = crosshairZ, x = crosshairX;
+                sliceExecutor.submit(() -> drawTopImage(top_image, z));
+                sliceExecutor.submit(() -> drawSideImage(side_image, x));
+            }
         });
 
         Side_slider.valueProperty().addListener((obs, o, n) -> {
-            int i = n.intValue();
-            sideVal.setText("Slice: " + i);
-            sliceExecutor.submit(() -> drawSideImage(side_image, i));
+            int x = n.intValue();
+            sideVal.setText("Slice: " + x);
+            crosshairX = x;
+            sliceExecutor.submit(() -> drawSideImage(side_image, x));
+            if (crosshairEnabled) {
+                int z = crosshairZ, y = crosshairY;
+                sliceExecutor.submit(() -> drawTopImage(top_image, z));
+                sliceExecutor.submit(() -> drawFrontImage(front_image, y));
+            }
         });
 
-        // ── VR/lighting listeners — submit on every change, generation counter
-        // cancels any in-progress render at the next row boundary so stale
-        // renders abort almost immediately and the latest value wins.
+        // ── VR / lighting listeners ───────────────────────────────────────────
         Skin_slider.valueProperty().addListener((obs, o, n) -> {
             double v = n.doubleValue();
             skinVal.setText(String.format("Opacity: %.2f", v));
@@ -143,6 +170,49 @@ public class Example extends Application {
             drawSideImage(side_image, 0);
         });
 
+        // ── Crosshair mouse handlers ──────────────────────────────────────────
+        // Axial view: click/drag updates X (→ Side_slider) and Y (→ Front_slider)
+        javafx.event.EventHandler<MouseEvent> topCrosshair = e -> {
+            if (!crosshairEnabled) return;
+            int ix = toImageCoord(e.getX(), TopView.getBoundsInLocal().getWidth(),  CT_x_axis);
+            int iy = toImageCoord(e.getY(), TopView.getBoundsInLocal().getHeight(), CT_y_axis);
+            crosshairX = ix; crosshairY = iy;
+            Side_slider.setValue(ix);
+            Front_slider.setValue(iy);
+            int z = crosshairZ;
+            sliceExecutor.submit(() -> drawTopImage(top_image, z));
+        };
+        TopView.setOnMousePressed(topCrosshair);
+        TopView.setOnMouseDragged(topCrosshair);
+
+        // Coronal view: click/drag updates X (→ Side_slider) and Z (→ Top_slider)
+        javafx.event.EventHandler<MouseEvent> frontCrosshair = e -> {
+            if (!crosshairEnabled) return;
+            int ix = toImageCoord(e.getX(), FrontView.getBoundsInLocal().getWidth(),  CT_x_axis);
+            int iz = toImageCoord(e.getY(), FrontView.getBoundsInLocal().getHeight(), CT_z_axis);
+            crosshairX = ix; crosshairZ = iz;
+            Side_slider.setValue(ix);
+            Top_slider.setValue(iz);
+            int y = crosshairY;
+            sliceExecutor.submit(() -> drawFrontImage(front_image, y));
+        };
+        FrontView.setOnMousePressed(frontCrosshair);
+        FrontView.setOnMouseDragged(frontCrosshair);
+
+        // Sagittal view: click/drag updates Y (→ Front_slider) and Z (→ Top_slider)
+        javafx.event.EventHandler<MouseEvent> sideCrosshair = e -> {
+            if (!crosshairEnabled) return;
+            int iy = toImageCoord(e.getX(), SideView.getBoundsInLocal().getWidth(),  CT_y_axis);
+            int iz = toImageCoord(e.getY(), SideView.getBoundsInLocal().getHeight(), CT_z_axis);
+            crosshairY = iy; crosshairZ = iz;
+            Front_slider.setValue(iy);
+            Top_slider.setValue(iz);
+            int x = crosshairX;
+            sliceExecutor.submit(() -> drawSideImage(side_image, x));
+        };
+        SideView.setOnMousePressed(sideCrosshair);
+        SideView.setOnMouseDragged(sideCrosshair);
+
         // ── Image panels ─────────────────────────────────────────────────────
         HBox imageRow = new HBox(12,
             imageCard("Axial View",    "Top-down (Z-axis)",    TopView),
@@ -153,18 +223,37 @@ public class Example extends Application {
         imageRow.setPadding(new Insets(16));
 
         // ── Buttons ──────────────────────────────────────────────────────────
-        Button volRend_button = styledButton("Volume Render");
+        Button volRend_button = styledButton("Volume Render", C_ACCENT);
         volRend_button.setOnAction(e -> {
             double v = Skin_slider.getValue();
             int gen = ++vrGeneration;
             vrExecutor.submit(() -> volumeRenderAll(images, v, gen));
         });
 
-        Button lightingButton = styledButton("Apply Lighting");
+        Button lightingButton = styledButton("Apply Lighting", C_ACCENT);
         lightingButton.setOnAction(e -> {
             CustomTriple light = new CustomTriple(lighting_slider.getValue(), 0, 0);
             int gen = ++vrGeneration;
             vrExecutor.submit(() -> lightingAll(images, light, gen));
+        });
+
+        Button crosshairButton = styledButton("Crosshair: OFF", C_ACCENT);
+        crosshairButton.setOnAction(e -> {
+            crosshairEnabled = !crosshairEnabled;
+            if (crosshairEnabled) {
+                crosshairButton.setText("Crosshair: ON");
+                setButtonColor(crosshairButton, C_GREEN);
+            } else {
+                crosshairButton.setText("Crosshair: OFF");
+                setButtonColor(crosshairButton, C_ACCENT);
+            }
+            // Redraw all slice views to add or remove the crosshair overlay
+            int z = crosshairZ, y = crosshairY, x = crosshairX;
+            sliceExecutor.submit(() -> {
+                drawTopImage(top_image, z);
+                drawFrontImage(front_image, y);
+                drawSideImage(side_image, x);
+            });
         });
 
         // ── Controls panel ───────────────────────────────────────────────────
@@ -173,6 +262,8 @@ public class Example extends Application {
 
         VBox controlsPanel = new VBox(10,
             controlsTitle,
+            crosshairButton,
+            separator(),
             sliderCard("Axial Slice (Z)",   Top_slider,      topVal,
                 "Scroll through horizontal cross-sections from the top of the skull down to the neck (0 – 112 slices)."),
             sliderCard("Coronal Slice (Y)",  Front_slider,    frontVal,
@@ -200,13 +291,10 @@ public class Example extends Application {
         // ── Header ───────────────────────────────────────────────────────────
         Label appTitle = new Label("CT Scan Visualisation Tool");
         appTitle.setStyle("-fx-text-fill:" + C_TEXT + ";-fx-font-size:18px;-fx-font-weight:bold;");
-
         Label subtitle = new Label("Volume Rendering & Slice Viewer");
         subtitle.setStyle("-fx-text-fill:" + C_MUTED + ";-fx-font-size:12px;");
-
         Region spacer = new Region();
         HBox.setHgrow(spacer, Priority.ALWAYS);
-
         HBox header = new HBox(10, appTitle, subtitle, spacer);
         header.setAlignment(Pos.CENTER_LEFT);
         header.setPadding(new Insets(14, 20, 14, 20));
@@ -218,9 +306,26 @@ public class Example extends Application {
         root.setRight(controlsScroll);
         root.setStyle("-fx-background-color:" + C_BG + ";");
 
-        Scene scene = new Scene(root, 1100, 780);
+        Scene scene = new Scene(root, 1300, 800);
         stage.setScene(scene);
         stage.show();
+    }
+
+    // ── Crosshair helpers ─────────────────────────────────────────────────────
+
+    // Maps a screen-space coordinate to a CT array index, clamped to valid range
+    private int toImageCoord(double screenPos, double viewSize, int ctSize) {
+        return Math.max(0, Math.min(ctSize - 1, (int)(screenPos * ctSize / viewSize)));
+    }
+
+    // Draws a cyan crosshair into a pixel buffer with a small gap at the intersection
+    private void drawCrosshair(int[] pixels, int w, int h, int cx, int cy) {
+        cx = Math.max(0, Math.min(w - 1, cx));
+        cy = Math.max(0, Math.min(h - 1, cy));
+        for (int y = 0; y < h; y++)
+            if (Math.abs(y - cy) > CROSSHAIR_GAP) pixels[y * w + cx] = CROSSHAIR_COLOR;
+        for (int x = 0; x < w; x++)
+            if (Math.abs(x - cx) > CROSSHAIR_GAP) pixels[cy * w + x] = CROSSHAIR_COLOR;
     }
 
     // ── Pixel helpers ─────────────────────────────────────────────────────────
@@ -244,12 +349,10 @@ public class Example extends Application {
     public void ReadData() throws IOException {
         File file = new File("CThead");
         DataInputStream in = new DataInputStream(new BufferedInputStream(new FileInputStream(file)));
-
         int i, j, k;
         min = Short.MAX_VALUE; max = Short.MIN_VALUE;
         short read;
         int b1, b2;
-
         cthead = new short[CT_z_axis][CT_y_axis][CT_x_axis];
         for (k = 0; k < CT_z_axis; k++) {
             for (j = 0; j < CT_y_axis; j++) {
@@ -271,18 +374,15 @@ public class Example extends Application {
         gradX = new float[CT_z_axis][CT_y_axis][CT_x_axis];
         gradY = new float[CT_z_axis][CT_y_axis][CT_x_axis];
         gradZ = new float[CT_z_axis][CT_y_axis][CT_x_axis];
-
         for (int z = 0; z < CT_z_axis; z++) {
             for (int y = 0; y < CT_y_axis; y++) {
                 for (int x = 0; x < CT_x_axis; x++) {
                     gradX[z][y][x] = x == 0            ? cthead[z][y][x+1] - cthead[z][y][x]
                                    : x < CT_x_axis - 1 ? cthead[z][y][x+1] - cthead[z][y][x-1]
                                    :                     cthead[z][y][x]   - cthead[z][y][x-1];
-
                     gradY[z][y][x] = y == 0            ? cthead[z][y+1][x] - cthead[z][y][x]
                                    : y < CT_y_axis - 1 ? cthead[z][y+1][x] - cthead[z][y-1][x]
                                    :                     cthead[z][y][x]   - cthead[z][y-1][x];
-
                     gradZ[z][y][x] = z == 0            ? cthead[z+1][y][x] - cthead[z][y][x]
                                    : z < CT_z_axis - 1 ? cthead[z+1][y][x] - cthead[z-1][y][x]
                                    :                     cthead[z][y][x]   - cthead[z-1][y][x];
@@ -293,52 +393,50 @@ public class Example extends Application {
 
     // ── Slice rendering ───────────────────────────────────────────────────────
 
-    public void TopDownSlice76(WritableImage image) {
-        drawTopImage(image, 76);
-    }
+    public void TopDownSlice76(WritableImage image) { drawTopImage(image, 76); }
 
+    // Axial view: image_x = CT_x, image_y = CT_y  →  crosshair at (crosshairX, crosshairY)
     public void drawTopImage(WritableImage image, int slice) {
         int w = (int) image.getWidth(), h = (int) image.getHeight();
         int[] pixels = new int[w * h];
         float range = max - min;
-
         IntStream.range(0, h).parallel().forEach(y -> {
             for (int x = 0; x < w; x++) {
                 int ci = (int)((cthead[slice][y][x] - min) / range * 255);
                 pixels[y * w + x] = (0xFF << 24) | (ci << 16) | (ci << 8) | ci;
             }
         });
-
+        if (crosshairEnabled) drawCrosshair(pixels, w, h, crosshairX, crosshairY);
         writePixels(image, pixels);
     }
 
+    // Coronal view: image_x = CT_x, image_y = CT_z  →  crosshair at (crosshairX, crosshairZ)
     public void drawFrontImage(WritableImage image, int slice) {
         int w = (int) image.getWidth(), h = (int) image.getHeight();
         int[] pixels = new int[w * h];
         float range = max - min;
-
         IntStream.range(0, h).parallel().forEach(z -> {
             for (int x = 0; x < w; x++) {
                 int ci = (int)((cthead[z][slice][x] - min) / range * 255);
                 pixels[z * w + x] = (0xFF << 24) | (ci << 16) | (ci << 8) | ci;
             }
         });
-
+        if (crosshairEnabled) drawCrosshair(pixels, w, h, crosshairX, crosshairZ);
         writePixels(image, pixels);
     }
 
+    // Sagittal view: image_x = CT_y, image_y = CT_z  →  crosshair at (crosshairY, crosshairZ)
     public void drawSideImage(WritableImage image, int slice) {
         int w = (int) image.getWidth(), h = (int) image.getHeight();
         int[] pixels = new int[w * h];
         float range = max - min;
-
         IntStream.range(0, h).parallel().forEach(z -> {
             for (int y = 0; y < w; y++) {
                 int ci = (int)((cthead[z][y][slice] - min) / range * 255);
                 pixels[z * w + y] = (0xFF << 24) | (ci << 16) | (ci << 8) | ci;
             }
         });
-
+        if (crosshairEnabled) drawCrosshair(pixels, w, h, crosshairY, crosshairZ);
         writePixels(image, pixels);
     }
 
@@ -353,9 +451,8 @@ public class Example extends Application {
     public void volumeRenderTopDown(WritableImage image, double skinOpacity, int gen) {
         int w = (int) image.getWidth(), h = (int) image.getHeight();
         int[] pixels = new int[w * h];
-
         IntStream.range(0, h).parallel().forEach(y -> {
-            if (vrGeneration != gen) return; // abort: newer render requested
+            if (vrGeneration != gen) return;
             for (int x = 0; x < w; x++) {
                 double r = 0, g = 0, b = 0, transparency = 1.0;
                 for (int z = 0; z < CT_z_axis; z++) {
@@ -374,14 +471,12 @@ public class Example extends Application {
                 pixels[y * w + x] = toArgb(Math.min(r, 1), Math.min(g, 1), Math.min(b, 1));
             }
         });
-
         if (vrGeneration == gen) writePixels(image, pixels);
     }
 
     public void volumeRenderFrontBack(WritableImage image, double skinOpacity, int gen) {
         int w = (int) image.getWidth(), h = (int) image.getHeight();
         int[] pixels = new int[w * h];
-
         IntStream.range(0, h).parallel().forEach(z -> {
             if (vrGeneration != gen) return;
             for (int x = 0; x < w; x++) {
@@ -402,14 +497,12 @@ public class Example extends Application {
                 pixels[z * w + x] = toArgb(Math.min(r, 1), Math.min(g, 1), Math.min(b, 1));
             }
         });
-
         if (vrGeneration == gen) writePixels(image, pixels);
     }
 
     public void volumeRenderSide(WritableImage image, double skinOpacity, int gen) {
         int w = (int) image.getWidth(), h = (int) image.getHeight();
         int[] pixels = new int[w * h];
-
         IntStream.range(0, h).parallel().forEach(z -> {
             if (vrGeneration != gen) return;
             for (int y = 0; y < w; y++) {
@@ -430,7 +523,6 @@ public class Example extends Application {
                 pixels[z * w + y] = toArgb(Math.min(r, 1), Math.min(g, 1), Math.min(b, 1));
             }
         });
-
         if (vrGeneration == gen) writePixels(image, pixels);
     }
 
@@ -448,27 +540,25 @@ public class Example extends Application {
         int w = (int) image.getWidth(), h = (int) image.getHeight();
         int[] pixels = new int[w * h];
         double lx = pointLight.getX(), ly = pointLight.getY(), lz = pointLight.getZ();
-
         IntStream.range(0, h).parallel().forEach(y -> {
             if (vrGeneration != gen) return;
             for (int x = 0; x < w; x++) {
                 double cr = 0, cg = 0, cb = 0;
                 for (int z = 0; z < CT_z_axis; z++) {
                     if (cthead[z][y][x] > 300) {
-                        double dx = lx - x, dy = ly - y, dz = lz - z;
-                        double dLen = Math.sqrt(dx*dx + dy*dy + dz*dz);
-                        if (dLen > 0) { dx /= dLen; dy /= dLen; dz /= dLen; }
+                        double dx = lx-x, dy = ly-y, dz = lz-z;
+                        double dLen = Math.sqrt(dx*dx+dy*dy+dz*dz);
+                        if (dLen > 0) { dx/=dLen; dy/=dLen; dz/=dLen; }
                         double nx = gradX[z][y][x], ny = gradY[z][y][x], nz = gradZ[z][y][x];
-                        double nLen = Math.sqrt(nx*nx + ny*ny + nz*nz);
-                        if (nLen > 0) { nx /= nLen; ny /= nLen; nz /= nLen; }
-                        double cosTheta = Math.max(0, dx*nx + dy*ny + dz*nz);
+                        double nLen = Math.sqrt(nx*nx+ny*ny+nz*nz);
+                        if (nLen > 0) { nx/=nLen; ny/=nLen; nz/=nLen; }
+                        double cosTheta = Math.max(0, dx*nx+dy*ny+dz*nz);
                         cr = cosTheta; cg = cosTheta; cb = cosTheta;
                     }
                 }
                 pixels[y * w + x] = toArgb(cr, cg, cb);
             }
         });
-
         if (vrGeneration == gen) writePixels(image, pixels);
     }
 
@@ -476,27 +566,25 @@ public class Example extends Application {
         int w = (int) image.getWidth(), h = (int) image.getHeight();
         int[] pixels = new int[w * h];
         double lx = pointLight.getX(), ly = pointLight.getY(), lz = pointLight.getZ();
-
         IntStream.range(0, h).parallel().forEach(z -> {
             if (vrGeneration != gen) return;
             for (int x = 0; x < w; x++) {
                 double cr = 0, cg = 0, cb = 0;
                 for (int y = 0; y < CT_y_axis - 1; y++) {
                     if (cthead[z][y][x] > 300) {
-                        double dx = lx - x, dy = ly - y, dz = lz - z;
-                        double dLen = Math.sqrt(dx*dx + dy*dy + dz*dz);
-                        if (dLen > 0) { dx /= dLen; dy /= dLen; dz /= dLen; }
+                        double dx = lx-x, dy = ly-y, dz = lz-z;
+                        double dLen = Math.sqrt(dx*dx+dy*dy+dz*dz);
+                        if (dLen > 0) { dx/=dLen; dy/=dLen; dz/=dLen; }
                         double nx = gradX[z][y][x], ny = gradY[z][y][x], nz = gradZ[z][y][x];
-                        double nLen = Math.sqrt(nx*nx + ny*ny + nz*nz);
-                        if (nLen > 0) { nx /= nLen; ny /= nLen; nz /= nLen; }
-                        double cosTheta = Math.max(0, dx*nx + dy*ny + dz*nz);
+                        double nLen = Math.sqrt(nx*nx+ny*ny+nz*nz);
+                        if (nLen > 0) { nx/=nLen; ny/=nLen; nz/=nLen; }
+                        double cosTheta = Math.max(0, dx*nx+dy*ny+dz*nz);
                         cr = cosTheta; cg = cosTheta; cb = cosTheta;
                     }
                 }
                 pixels[z * w + x] = toArgb(cr, cg, cb);
             }
         });
-
         if (vrGeneration == gen) writePixels(image, pixels);
     }
 
@@ -504,27 +592,25 @@ public class Example extends Application {
         int w = (int) image.getWidth(), h = (int) image.getHeight();
         int[] pixels = new int[w * h];
         double lx = pointLight.getX(), ly = pointLight.getY(), lz = pointLight.getZ();
-
         IntStream.range(0, h).parallel().forEach(z -> {
             if (vrGeneration != gen) return;
             for (int y = 0; y < w; y++) {
                 double cr = 0, cg = 0, cb = 0;
                 for (int x = 0; x < CT_x_axis - 1; x++) {
                     if (cthead[z][y][x] > 300) {
-                        double dx = lx - x, dy = ly - y, dz = lz - z;
-                        double dLen = Math.sqrt(dx*dx + dy*dy + dz*dz);
-                        if (dLen > 0) { dx /= dLen; dy /= dLen; dz /= dLen; }
+                        double dx = lx-x, dy = ly-y, dz = lz-z;
+                        double dLen = Math.sqrt(dx*dx+dy*dy+dz*dz);
+                        if (dLen > 0) { dx/=dLen; dy/=dLen; dz/=dLen; }
                         double nx = gradX[z][y][x], ny = gradY[z][y][x], nz = gradZ[z][y][x];
-                        double nLen = Math.sqrt(nx*nx + ny*ny + nz*nz);
-                        if (nLen > 0) { nx /= nLen; ny /= nLen; nz /= nLen; }
-                        double cosTheta = Math.max(0, dx*nx + dy*ny + dz*nz);
+                        double nLen = Math.sqrt(nx*nx+ny*ny+nz*nz);
+                        if (nLen > 0) { nx/=nLen; ny/=nLen; nz/=nLen; }
+                        double cosTheta = Math.max(0, dx*nx+dy*ny+dz*nz);
                         cr = cosTheta; cg = cosTheta; cb = cosTheta;
                     }
                 }
                 pixels[z * w + y] = toArgb(cr, cg, cb);
             }
         });
-
         if (vrGeneration == gen) writePixels(image, pixels);
     }
 
@@ -635,22 +721,15 @@ public class Example extends Application {
     private VBox sliderCard(String title, Slider slider, Label valueLabel, String description) {
         Label titleLabel = new Label(title);
         titleLabel.setStyle("-fx-text-fill:" + C_TEXT + ";-fx-font-weight:bold;-fx-font-size:13px;");
-
         HBox titleRow = new HBox(8, titleLabel, valueLabel);
         titleRow.setAlignment(Pos.CENTER_LEFT);
-
         Label descLabel = new Label(description);
         descLabel.setStyle("-fx-text-fill:" + C_MUTED + ";-fx-font-size:11px;");
         descLabel.setWrapText(true);
-
         VBox card = new VBox(5, titleRow, slider, descLabel);
         card.setStyle(
-            "-fx-background-color:#0f172a;" +
-            "-fx-background-radius:8;" +
-            "-fx-border-color:" + C_BORDER + ";" +
-            "-fx-border-radius:8;" +
-            "-fx-border-width:1;" +
-            "-fx-padding:10;"
+            "-fx-background-color:#0f172a;-fx-background-radius:8;" +
+            "-fx-border-color:" + C_BORDER + ";-fx-border-radius:8;-fx-border-width:1;-fx-padding:10;"
         );
         return card;
     }
@@ -658,54 +737,43 @@ public class Example extends Application {
     private VBox imageCard(String title, String subtitle, ImageView view) {
         Label titleLabel = new Label(title);
         titleLabel.setStyle("-fx-text-fill:" + C_TEXT + ";-fx-font-weight:bold;-fx-font-size:13px;");
-
         Label subLabel = new Label(subtitle);
         subLabel.setStyle("-fx-text-fill:" + C_MUTED + ";-fx-font-size:11px;");
-
         VBox card = new VBox(6, titleLabel, subLabel, view);
         card.setAlignment(Pos.CENTER);
         card.setStyle(
-            "-fx-background-color:" + C_PANEL + ";" +
-            "-fx-background-radius:10;" +
-            "-fx-border-color:" + C_BORDER + ";" +
-            "-fx-border-radius:10;" +
-            "-fx-border-width:1;" +
-            "-fx-padding:12;"
+            "-fx-background-color:" + C_PANEL + ";-fx-background-radius:10;" +
+            "-fx-border-color:" + C_BORDER + ";-fx-border-radius:10;-fx-border-width:1;-fx-padding:12;"
         );
         return card;
     }
 
-    private Button styledButton(String text) {
+    private static final String BTN_BASE =
+        "-fx-text-fill:#ffffff;-fx-font-weight:bold;-fx-font-size:13px;" +
+        "-fx-background-radius:7;-fx-padding:8 16;-fx-cursor:hand;";
+
+    private Button styledButton(String text, String color) {
         Button b = new Button(text);
         b.setMaxWidth(Double.MAX_VALUE);
-        b.setStyle(
-            "-fx-background-color:" + C_ACCENT + ";" +
-            "-fx-text-fill:#ffffff;" +
-            "-fx-font-weight:bold;" +
-            "-fx-font-size:13px;" +
-            "-fx-background-radius:7;" +
-            "-fx-padding:8 16;" +
-            "-fx-cursor:hand;"
-        );
-        b.setOnMouseEntered(e -> b.setStyle(
-            "-fx-background-color:#2563eb;" +
-            "-fx-text-fill:#ffffff;" +
-            "-fx-font-weight:bold;" +
-            "-fx-font-size:13px;" +
-            "-fx-background-radius:7;" +
-            "-fx-padding:8 16;" +
-            "-fx-cursor:hand;"
-        ));
-        b.setOnMouseExited(e -> b.setStyle(
-            "-fx-background-color:" + C_ACCENT + ";" +
-            "-fx-text-fill:#ffffff;" +
-            "-fx-font-weight:bold;" +
-            "-fx-font-size:13px;" +
-            "-fx-background-radius:7;" +
-            "-fx-padding:8 16;" +
-            "-fx-cursor:hand;"
-        ));
+        b.setStyle("-fx-background-color:" + color + ";" + BTN_BASE);
+        b.setOnMouseEntered(e -> b.setStyle("-fx-background-color:" + darken(color) + ";" + BTN_BASE));
+        b.setOnMouseExited(e  -> b.setStyle("-fx-background-color:" + color + ";" + BTN_BASE));
         return b;
+    }
+
+    private void setButtonColor(Button b, String color) {
+        b.setStyle("-fx-background-color:" + color + ";" + BTN_BASE);
+        b.setOnMouseEntered(e -> b.setStyle("-fx-background-color:" + darken(color) + ";" + BTN_BASE));
+        b.setOnMouseExited(e  -> b.setStyle("-fx-background-color:" + color + ";" + BTN_BASE));
+    }
+
+    // Very simple hex colour darkener — drops each channel by ~15%
+    private String darken(String hex) {
+        int rgb = Integer.parseInt(hex.substring(1), 16);
+        int r = Math.max(0, ((rgb >> 16) & 0xFF) - 38);
+        int g = Math.max(0, ((rgb >>  8) & 0xFF) - 38);
+        int bv = Math.max(0,  (rgb        & 0xFF) - 38);
+        return String.format("#%02x%02x%02x", r, g, bv);
     }
 
     private Separator separator() {
@@ -714,7 +782,5 @@ public class Example extends Application {
         return sep;
     }
 
-    public static void main(String[] args) {
-        launch();
-    }
+    public static void main(String[] args) { launch(); }
 }
