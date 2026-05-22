@@ -1,6 +1,5 @@
 import java.io.FileInputStream;
 import java.io.FileNotFoundException;
-import javafx.animation.PauseTransition;
 import javafx.application.Application;
 import javafx.application.Platform;
 import javafx.geometry.Insets;
@@ -22,7 +21,6 @@ import javafx.scene.layout.Region;
 import javafx.scene.layout.VBox;
 import javafx.scene.paint.Color;
 import javafx.stage.Stage;
-import javafx.util.Duration;
 import java.io.*;
 import java.util.ArrayList;
 import java.util.Vector;
@@ -121,32 +119,21 @@ public class Example extends Application {
             sliceExecutor.submit(() -> drawSideImage(side_image, i));
         });
 
-        // ── VR/lighting listeners — generation-based cancellation + 30ms debounce
-        // The debounce prevents queue buildup while dragging quickly.
-        // The generation counter makes any in-progress render abort at the next
-        // row boundary so the new render can start almost immediately.
-        PauseTransition skinDebounce = new PauseTransition(Duration.millis(30));
+        // ── VR/lighting listeners — submit on every change, generation counter
+        // cancels any in-progress render at the next row boundary so stale
+        // renders abort almost immediately and the latest value wins.
         Skin_slider.valueProperty().addListener((obs, o, n) -> {
             double v = n.doubleValue();
             skinVal.setText(String.format("Opacity: %.2f", v));
             int gen = ++vrGeneration;
-            skinDebounce.setOnFinished(e -> {
-                if (vrGeneration == gen)
-                    vrExecutor.submit(() -> volumeRenderAll(images, v, gen));
-            });
-            skinDebounce.playFromStart();
+            vrExecutor.submit(() -> volumeRenderAll(images, v, gen));
         });
 
-        PauseTransition lightingDebounce = new PauseTransition(Duration.millis(30));
         lighting_slider.valueProperty().addListener((obs, o, n) -> {
             int i = n.intValue();
             lightingVal.setText("Position: " + i);
             int gen = ++vrGeneration;
-            lightingDebounce.setOnFinished(e -> {
-                if (vrGeneration == gen)
-                    vrExecutor.submit(() -> lightingAll(images, new CustomTriple(i, 0.0, 0.0), gen));
-            });
-            lightingDebounce.playFromStart();
+            vrExecutor.submit(() -> lightingAll(images, new CustomTriple(i, 0.0, 0.0), gen));
         });
 
         // ── Initial render ───────────────────────────────────────────────────
