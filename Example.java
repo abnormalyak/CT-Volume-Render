@@ -361,81 +361,130 @@ public class Example extends Application {
             rot3DYaw   = startRot[1] + (e.getSceneX() - anchor[0]) * 0.01;
             int gen = ++vr3DGeneration;
             double p = rot3DPitch, y = rot3DYaw;
-            vr3DExecutor.submit(() -> render3D(image, p, y, gen));
+            // Render at half resolution during drag — pixels are filled into 2x2
+            // blocks, so each render does ~1/4 of the work and feels fluid.
+            vr3DExecutor.submit(() -> render3D(image, p, y, gen, 2));
+        });
+        view.setOnMouseReleased(e -> {
+            // Full-resolution render once dragging stops
+            int gen = ++vr3DGeneration;
+            double p = rot3DPitch, y = rot3DYaw;
+            vr3DExecutor.submit(() -> render3D(image, p, y, gen, 1));
         });
 
         stage3D.setScene(new Scene(root, W, H));
         stage3D.show();
 
-        // Initial render
         int gen = ++vr3DGeneration;
         double p = rot3DPitch, y = rot3DYaw;
-        vr3DExecutor.submit(() -> render3D(image, p, y, gen));
+        vr3DExecutor.submit(() -> render3D(image, p, y, gen, 1));
     }
 
     // Per-pixel raycaster with rotation. Same diffuse-lighting model as the 2-D
     // lightingTopDown etc., but the ray direction is rotated by (pitch, yaw)
     // before walking the volume, giving an arbitrary 3-D view that the user
     // can drag to spin.
-    private void render3D(WritableImage image, double pitch, double yaw, int gen) {
+    //
+    // Performance tricks:
+    //   - downsample > 1 computes 1 ray per (ds × ds) block and fills the block
+    //     with that colour, so dragging renders ~1/(ds²) of the pixels.
+    //   - Ray vs volume-AABB intersection (slab method) finds the t-range that
+    //     actually hits the volume, so we don't walk through empty space.
+    //   - Ray step size is 1.5 voxels rather than 1.0 — minor quality loss,
+    //     ~33% fewer samples per ray.
+    private void render3D(WritableImage image, double pitch, double yaw, int gen, int downsample) {
+        if (vr3DGeneration != gen) return; // bail before allocating
         int w = (int) image.getWidth(), h = (int) image.getHeight();
         int[] pixels = new int[w * h];
 
         double cosP = Math.cos(pitch), sinP = Math.sin(pitch);
         double cosY = Math.cos(yaw),   sinY = Math.sin(yaw);
 
-        double vcx = CT_x_axis / 2.0;
-        double vcy = CT_y_axis / 2.0;
-        double vcz = CT_z_axis / 2.0;
+        final double vcx = CT_x_axis / 2.0;
+        final double vcy = CT_y_axis / 2.0;
+        final double vcz = CT_z_axis / 2.0;
 
-        // Light direction in volume space: inverse-rotated (0,0,-1).
-        // i.e. the light comes from behind the camera and rotates with it,
-        // so the camera-facing side of the skull is always lit.
-        double lx =  sinY * cosP;
-        double ly = -sinP;
-        double lz = -cosY * cosP;
+        // Ray direction in volume space — constant for all rays.
+        // Nudged away from exact zero so the slab method never hits 0×∞ = NaN.
+        double rx = -sinY * cosP;
+        double ry =  sinP;
+        double rz =  cosY * cosP;
+        if (Math.abs(rx) < 1e-9) rx = rx >= 0 ? 1e-9 : -1e-9;
+        if (Math.abs(ry) < 1e-9) ry = ry >= 0 ? 1e-9 : -1e-9;
+        if (Math.abs(rz) < 1e-9) rz = rz >= 0 ? 1e-9 : -1e-9;
+        final double rdx = rx, rdy = ry, rdz = rz;
+        final double invRdx = 1.0 / rdx, invRdy = 1.0 / rdy, invRdz = 1.0 / rdz;
 
-        int maxSteps  = (int) Math.ceil(Math.sqrt(
-            CT_x_axis * CT_x_axis + CT_y_axis * CT_y_axis + CT_z_axis * CT_z_axis));
-        int startOff  = -maxSteps / 2;
+        // Light from camera (=-ray) so the visible side of the skull is always lit
+        final double lx = -rdx, ly = -rdy, lz = -rdz;
 
-        IntStream.range(0, h).parallel().forEach(py -> {
-            if (vr3DGeneration != gen) return; // newer render queued — abort
-            double camY = py - h / 2.0;
-            for (int px = 0; px < w; px++) {
-                double camX = px - w / 2.0;
+        final double STEP = 1.5;
+        final int ds = downsample;
+        final double cosPf = cosP, sinPf = sinP, cosYf = cosY, sinYf = sinY;
+        final int wF = w, hF = h;
+
+        int yBlocks = (hF + ds - 1) / ds;
+        IntStream.range(0, yBlocks).parallel().forEach(yBlock -> {
+            if (vr3DGeneration != gen) return;
+            int py0 = yBlock * ds;
+            double camY = py0 - hF / 2.0;
+            double ypCamY =  cosPf * camY;
+            double zpCamY = -sinPf * camY;
+
+            for (int px0 = 0; px0 < wF; px0 += ds) {
+                double camX = px0 - wF / 2.0;
+
+                // Ray origin in volume space (camera's view plane at z=0).
+                double ox = cosYf * camX - sinYf * zpCamY + vcx;
+                double oy = ypCamY + vcy;
+                double oz = sinYf * camX + cosYf * zpCamY + vcz;
+
+                // Slab method: ray vs AABB [0,CT_x_axis]×[0,CT_y_axis]×[0,CT_z_axis]
+                double tx1 = (0          - ox) * invRdx;
+                double tx2 = (CT_x_axis - ox) * invRdx;
+                if (tx1 > tx2) { double t = tx1; tx1 = tx2; tx2 = t; }
+                double ty1 = (0          - oy) * invRdy;
+                double ty2 = (CT_y_axis - oy) * invRdy;
+                if (ty1 > ty2) { double t = ty1; ty1 = ty2; ty2 = t; }
+                double tz1 = (0          - oz) * invRdz;
+                double tz2 = (CT_z_axis - oz) * invRdz;
+                if (tz1 > tz2) { double t = tz1; tz1 = tz2; tz2 = t; }
+
+                double tEnter = Math.max(Math.max(tx1, ty1), tz1);
+                double tExit  = Math.min(Math.min(tx2, ty2), tz2);
+
                 double color = 0;
-
-                for (int t = 0; t < maxSteps; t++) {
-                    double camZ = startOff + t;
-
-                    // Inverse rotation: Rx(-pitch) then Ry(-yaw) on (camX, camY, camZ)
-                    double yp = cosP * camY + sinP * camZ;
-                    double zp = -sinP * camY + cosP * camZ;
-                    double vx = cosY * camX - sinY * zp;
-                    double vy = yp;
-                    double vz = sinY * camX + cosY * zp;
-
-                    int sx = (int) (vx + vcx);
-                    int sy = (int) (vy + vcy);
-                    int sz = (int) (vz + vcz);
-                    if (sx < 0 || sx >= CT_x_axis ||
-                        sy < 0 || sy >= CT_y_axis ||
-                        sz < 0 || sz >= CT_z_axis) continue;
-
-                    if (cthead[sz][sy][sx] > 300) {
-                        double nx = -gradX[sz][sy][sx];
-                        double ny = -gradY[sz][sy][sx];
-                        double nz = -gradZ[sz][sy][sx];
-                        double nLen = Math.sqrt(nx*nx + ny*ny + nz*nz);
-                        if (nLen > 0) { nx /= nLen; ny /= nLen; nz /= nLen; }
-                        color = Math.max(0, lx*nx + ly*ny + lz*nz);
-                        break;
+                if (tEnter <= tExit && tExit >= 0) {
+                    double t = Math.max(tEnter, 0);
+                    while (t <= tExit) {
+                        int sx = (int) (ox + rdx * t);
+                        int sy = (int) (oy + rdy * t);
+                        int sz = (int) (oz + rdz * t);
+                        if (sx >= 0 && sx < CT_x_axis &&
+                            sy >= 0 && sy < CT_y_axis &&
+                            sz >= 0 && sz < CT_z_axis &&
+                            cthead[sz][sy][sx] > 300) {
+                            double nx = -gradX[sz][sy][sx];
+                            double ny = -gradY[sz][sy][sx];
+                            double nz = -gradZ[sz][sy][sx];
+                            double nLen = Math.sqrt(nx*nx + ny*ny + nz*nz);
+                            if (nLen > 0) { nx /= nLen; ny /= nLen; nz /= nLen; }
+                            color = Math.max(0, lx*nx + ly*ny + lz*nz);
+                            break;
+                        }
+                        t += STEP;
                     }
                 }
 
                 int ci = (int) (color * 255);
-                pixels[py * w + px] = (0xFF << 24) | (ci << 16) | (ci << 8) | ci;
+                int argb = (0xFF << 24) | (ci << 16) | (ci << 8) | ci;
+                // Fill the ds × ds block with this colour
+                for (int dy = 0; dy < ds && py0 + dy < hF; dy++) {
+                    int rowOff = (py0 + dy) * wF;
+                    for (int dx = 0; dx < ds && px0 + dx < wF; dx++) {
+                        pixels[rowOff + px0 + dx] = argb;
+                    }
+                }
             }
         });
 
